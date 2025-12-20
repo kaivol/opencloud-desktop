@@ -110,10 +110,11 @@ protected:
 
     QString _clientId;
     QString _clientSecret;
+    QString _scopes;
 
     QUrl _registrationEndpoint;
 
-    virtual void fetchWellKnown();
+    virtual void updateOidcConfig();
 
     QNetworkReply *postTokenRequest(QUrlQuery &&queryItems);
 
@@ -159,7 +160,7 @@ Q_SIGNALS:
 
 
 protected:
-    void fetchWellKnown() override;
+    void updateOidcConfig() override;
 
 
     void restore();

@@ -34,6 +34,7 @@
 #include <QNetworkReply>
 #include <QPixmap>
 #include <QRandomGenerator>
+#include <QtConcurrent>
 
 using namespace std::chrono;
 using namespace std::chrono_literals;
@@ -45,6 +46,7 @@ Q_LOGGING_CATEGORY(lcOauth, "sync.credentials.oauth", QtInfoMsg)
 namespace {
 
 const QString wellKnownPathC = QStringLiteral("/.well-known/openid-configuration");
+const QString oidcConfigPathC = QStringLiteral("/oidc-config");
 QString redirectUrlC()
 {
     return QStringLiteral("http://127.0.0.1");
@@ -237,6 +239,7 @@ OAuth::OAuth(const QUrl &serverUrl, QNetworkAccessManager *networkAccessManager,
     , _networkAccessManager(networkAccessManager)
     , _clientId(Theme::instance()->oauthClientId())
     , _clientSecret(Theme::instance()->oauthClientSecret())
+    , _scopes(Theme::instance()->openIdConnectScopes())
     , _supportedPromtValues(defaultOauthPromtValue())
 {
 }
@@ -285,7 +288,7 @@ void OAuth::startAuthentication()
         updateDynamicRegistration();
     });
 
-    fetchWellKnown();
+    updateOidcConfig();
 
     QObject::connect(&_server, &QTcpServer::newConnection, this, [this] {
         while (QPointer<QTcpSocket> socket = _server.nextPendingConnection()) {
@@ -433,7 +436,7 @@ QNetworkReply *OAuth::postTokenRequest(QUrlQuery &&queryItems)
     req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/x-www-form-urlencoded; charset=UTF-8"));
     req.setAttribute(HttpCredentials::DontAddCredentialsAttribute, true);
 
-    queryItems.addQueryItem(QStringLiteral("scope"), QString::fromUtf8(QUrl::toPercentEncoding(Theme::instance()->openIdConnectScopes())));
+    queryItems.addQueryItem(QStringLiteral("scope"), QString::fromUtf8(QUrl::toPercentEncoding(_scopes)));
     req.setUrl(_tokenEndpoint);
     return _networkAccessManager->post(req, queryItems.toString(QUrl::FullyEncoded).toUtf8());
 }
@@ -460,7 +463,7 @@ QUrl OAuth::authorisationLink() const
         {QStringLiteral("redirect_uri"), QStringLiteral("%1:%2").arg(redirectUrlC(), QString::number(_server.serverPort()))},
         {QStringLiteral("code_challenge"), QString::fromLatin1(code_challenge)},
         {QStringLiteral("code_challenge_method"), QStringLiteral("S256")},
-        {QStringLiteral("scope"), QString::fromUtf8(QUrl::toPercentEncoding(Theme::instance()->openIdConnectScopes()))},
+        {QStringLiteral("scope"), QString::fromUtf8(QUrl::toPercentEncoding(_scopes))},
         {QStringLiteral("prompt"), QString::fromUtf8(QUrl::toPercentEncoding(toString(_supportedPromtValues)))},
         {QStringLiteral("state"), QString::fromUtf8(_state)},
     };
@@ -523,7 +526,53 @@ void OAuth::updateDynamicRegistration()
     Q_EMIT dynamicRegistrationDataReceived();
 }
 
-void OAuth::fetchWellKnown()
+struct OidcConfig
+{
+    QUrl issuer;
+    QString clientId;
+    QString scope;
+};
+
+std::optional<OidcConfig> parseOidcConfig(const QByteArray& json)
+{
+    QJsonParseError err = {};
+    QJsonObject data = QJsonDocument::fromJson(json, &err).object();
+    if (err.error != QJsonParseError::NoError) {
+        return std::nullopt;
+    }
+    const auto issuer = data[QStringLiteral("issuer")].toString();
+    if (issuer.isNull()) {
+        qCDebug(lcOauth) << u"failed to get issuer from oidc-config";
+        return std::nullopt;
+    }
+    const auto clientId = data[QStringLiteral("client_id")].toString();
+    if (clientId.isNull()) {
+        qCDebug(lcOauth) << u"failed to get client id from oidc-config";
+        return std::nullopt;
+    }
+    const auto scope = data[QStringLiteral("scope")].toString();
+    if (scope.isNull()) {
+        qCDebug(lcOauth) << u"failed to get scope from oidc-config";
+        return std::nullopt;
+    }
+    return OidcConfig {
+        QUrl(issuer),
+        clientId,
+        scope,
+    };
+}
+
+struct OidcWellKnown
+{
+
+};
+
+// OidcWellKnown parseWellKnown()
+// {
+//
+// }
+
+void OAuth::updateOidcConfig()
 {
     const QPair<QString, QString> urls = Theme::instance()->oauthOverrideAuthUrl();
 
@@ -537,68 +586,95 @@ void OAuth::fetchWellKnown()
         _wellKnownFinished = true;
         Q_EMIT fetchWellKnownFinished();
     } else {
-        qCDebug(lcOauth) << u"fetching" << wellKnownPathC;
-
         QNetworkRequest req;
         req.setAttribute(HttpCredentials::DontAddCredentialsAttribute, true);
-        req.setUrl(Utility::concatUrlPath(_serverUrl, wellKnownPathC));
+        req.setUrl(Utility::concatUrlPath(_serverUrl, oidcConfigPathC));
         req.setTransferTimeout(defaultTimeoutMs());
 
+        qCDebug(lcOauth) << u"failed to parse oidc-config " << req.url();
         auto reply = _networkAccessManager->get(req);
 
         connect(reply, &QNetworkReply::finished, this, [reply, this] {
-            _wellKnownFinished = true;
-            if (reply->error() != QNetworkReply::NoError) {
-                qCDebug(lcOauth) << u"failed to fetch .well-known reply, error:" << reply->error();
-                if (_isRefreshingToken) {
-                    Q_EMIT refreshError(reply->error(), reply->errorString());
+            auto issuer = _serverUrl;
+
+            if (reply->error() == QNetworkReply::NoError) {
+                if (const auto config = parseOidcConfig(reply->readAll())) {
+                    _clientId = config->clientId;
+                    _scopes = config->scope;
+                    issuer = config->issuer;
+                    qCDebug(lcOauth) << u"parsing .well-known reply successful, auth endpoint" << _authEndpoint << u"and token endpoint" << _tokenEndpoint
+                                     << u"and registration endpoint" << _registrationEndpoint;
                 } else {
+                    qCDebug(lcOauth) << u"failed to parse oidc-config";
+                    Q_EMIT result(Error);
+                    Q_EMIT fetchWellKnownFinished();
+                    return;
+                }
+            } else {
+                qCDebug(lcOauth) << u"failed to fetch oidc-config reply, error:" << reply->error();
+            }
+
+            QNetworkRequest req;
+            req.setAttribute(HttpCredentials::DontAddCredentialsAttribute, true);
+            req.setUrl(Utility::concatUrlPath(issuer, wellKnownPathC));
+            req.setTransferTimeout(defaultTimeoutMs());
+
+            auto reply = _networkAccessManager->get(req);
+
+            connect(reply, &QNetworkReply::finished, this, [reply, this] {
+                _wellKnownFinished = true;
+                if (reply->error() != QNetworkReply::NoError) {
+                    qCDebug(lcOauth) << u"failed to fetch .well-known reply, error:" << reply->error();
+                    if (_isRefreshingToken) {
+                        Q_EMIT refreshError(reply->error(), reply->errorString());
+                    } else {
+                        Q_EMIT result(Error);
+                    }
+                    return;
+                }
+                QJsonParseError err = {};
+                QJsonObject data = QJsonDocument::fromJson(reply->readAll(), &err).object();
+                if (err.error == QJsonParseError::NoError) {
+                    _authEndpoint = QUrl::fromEncoded(data[QStringLiteral("authorization_endpoint")].toString().toUtf8());
+                    _tokenEndpoint = QUrl::fromEncoded(data[QStringLiteral("token_endpoint")].toString().toUtf8());
+                    _registrationEndpoint = QUrl::fromEncoded(data[QStringLiteral("registration_endpoint")].toString().toUtf8());
+
+                    if (_clientSecret.isEmpty()) {
+                        _endpointAuthMethod = TokenEndpointAuthMethods::none;
+                    } else {
+                        const auto authMethods = data.value(QStringLiteral("token_endpoint_auth_methods_supported")).toArray();
+                        if (authMethods.contains(QStringLiteral("none"))) {
+                            _endpointAuthMethod = TokenEndpointAuthMethods::none;
+                        } else if (authMethods.contains(QStringLiteral("client_secret_post"))) {
+                            _endpointAuthMethod = TokenEndpointAuthMethods::client_secret_post;
+                        } else if (authMethods.contains(QStringLiteral("client_secret_basic"))) {
+                            _endpointAuthMethod = TokenEndpointAuthMethods::client_secret_basic;
+                        } else {
+                            OC_ASSERT_X(
+                                false, qPrintable(QStringLiteral("Unsupported token_endpoint_auth_methods_supported: %1").arg(QDebug::toString(authMethods))));
+                        }
+                    }
+                    const auto promtValuesSupported = data.value(QStringLiteral("prompt_values_supported")).toArray();
+                    if (!promtValuesSupported.isEmpty()) {
+                        _supportedPromtValues = PromptValuesSupported::none;
+                        for (const auto &x : promtValuesSupported) {
+                            const auto flag = Utility::stringToEnum<PromptValuesSupported>(x.toString());
+                            // only use flags present in Theme::instance()->openIdConnectPrompt()
+                            if (flag & defaultOauthPromtValue())
+                                _supportedPromtValues |= flag;
+                        }
+                    }
+
+                    qCDebug(lcOauth) << u"parsing .well-known reply successful, auth endpoint" << _authEndpoint << u"and token endpoint" << _tokenEndpoint
+                                     << u"and registration endpoint" << _registrationEndpoint;
+                } else if (err.error == QJsonParseError::IllegalValue) {
+                    qCDebug(lcOauth) << u"failed to parse .well-known reply as JSON, server might not support OIDC";
+                } else {
+                    qCDebug(lcOauth) << u"failed to parse .well-known reply, error:" << err.error;
                     Q_EMIT result(Error);
                 }
-                return;
-            }
-            QJsonParseError err = {};
-            QJsonObject data = QJsonDocument::fromJson(reply->readAll(), &err).object();
-            if (err.error == QJsonParseError::NoError) {
-                _authEndpoint = QUrl::fromEncoded(data[QStringLiteral("authorization_endpoint")].toString().toUtf8());
-                _tokenEndpoint = QUrl::fromEncoded(data[QStringLiteral("token_endpoint")].toString().toUtf8());
-                _registrationEndpoint = QUrl::fromEncoded(data[QStringLiteral("registration_endpoint")].toString().toUtf8());
-
-                if (_clientSecret.isEmpty()) {
-                    _endpointAuthMethod = TokenEndpointAuthMethods::none;
-                } else {
-                    const auto authMethods = data.value(QStringLiteral("token_endpoint_auth_methods_supported")).toArray();
-                    if (authMethods.contains(QStringLiteral("none"))) {
-                        _endpointAuthMethod = TokenEndpointAuthMethods::none;
-                    } else if (authMethods.contains(QStringLiteral("client_secret_post"))) {
-                        _endpointAuthMethod = TokenEndpointAuthMethods::client_secret_post;
-                    } else if (authMethods.contains(QStringLiteral("client_secret_basic"))) {
-                        _endpointAuthMethod = TokenEndpointAuthMethods::client_secret_basic;
-                    } else {
-                        OC_ASSERT_X(
-                            false, qPrintable(QStringLiteral("Unsupported token_endpoint_auth_methods_supported: %1").arg(QDebug::toString(authMethods))));
-                    }
-                }
-                const auto promtValuesSupported = data.value(QStringLiteral("prompt_values_supported")).toArray();
-                if (!promtValuesSupported.isEmpty()) {
-                    _supportedPromtValues = PromptValuesSupported::none;
-                    for (const auto &x : promtValuesSupported) {
-                        const auto flag = Utility::stringToEnum<PromptValuesSupported>(x.toString());
-                        // only use flags present in Theme::instance()->openIdConnectPrompt()
-                        if (flag & defaultOauthPromtValue())
-                            _supportedPromtValues |= flag;
-                    }
-                }
-
-                qCDebug(lcOauth) << u"parsing .well-known reply successful, auth endpoint" << _authEndpoint << u"and token endpoint" << _tokenEndpoint
-                                 << u"and registration endpoint" << _registrationEndpoint;
-            } else if (err.error == QJsonParseError::IllegalValue) {
-                qCDebug(lcOauth) << u"failed to parse .well-known reply as JSON, server might not support OIDC";
-            } else {
-                qCDebug(lcOauth) << u"failed to parse .well-known reply, error:" << err.error;
-                Q_EMIT result(Error);
-            }
-            Q_EMIT fetchWellKnownFinished();
+                Q_EMIT fetchWellKnownFinished();
+            });
         });
     }
 }
@@ -664,7 +740,7 @@ void AccountBasedOAuth::startAuthentication()
     restore();
 }
 
-void AccountBasedOAuth::fetchWellKnown()
+void AccountBasedOAuth::updateOidcConfig()
 {
     qCDebug(lcOauth) << u"starting CheckServerJob before fetching" << wellKnownPathC;
 
@@ -673,7 +749,7 @@ void AccountBasedOAuth::fetchWellKnown()
     connect(checkServerJob, &CoreJob::finished, this, [checkServerJob, this]() {
         if (checkServerJob->success()) {
             qCDebug(lcOauth) << u"CheckServerJob succeeded, fetching" << wellKnownPathC;
-            OAuth::fetchWellKnown();
+            OAuth::updateOidcConfig();
         } else {
             qCDebug(lcOauth) << u"CheckServerJob failed, error:" << checkServerJob->errorMessage();
             if (_isRefreshingToken) {
@@ -771,7 +847,7 @@ void AccountBasedOAuth::refreshAuthentication(const QString &refreshToken)
             });
             updateDynamicRegistration();
         });
-        fetchWellKnown();
+        updateOidcConfig();
     });
     restore();
 }
