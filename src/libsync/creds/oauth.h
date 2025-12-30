@@ -110,6 +110,7 @@ protected:
 
     QString _clientId;
     QString _clientSecret;
+    QString _additionalScope;
 
     QUrl _registrationEndpoint;
 
